@@ -10,7 +10,7 @@ if readme_path.exists():
 
 setup(
     name="django-payments-blockbee",
-    version="1.0.4",
+    version="1.0.5",
     description="BlockBee Checkout backend for django-payments.",
     long_description=long_description,
     long_description_content_type="text/markdown",
@@ -49,6 +49,7 @@ setup(
         "Programming Language :: Python :: 3.10",
         "Programming Language :: Python :: 3.11",
         "Programming Language :: Python :: 3.12",
+        "Programming Language :: Python :: 3.13",
         "Topic :: Internet :: WWW/HTTP",
         "Topic :: Software Development :: Libraries :: Python Modules",
     ],

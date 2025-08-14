@@ -1,49 +1,53 @@
 import base64
 
-from cryptography.exceptions import InvalidSignature
 from django.http import HttpResponse, HttpResponseBadRequest
-from payments import PaymentStatus, get_payment_model
+
+from payments import PaymentStatus, RedirectNeeded
 from payments.core import BasicProvider
+
+from django.conf import settings
 
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.backends import default_backend
+from cryptography.exceptions import InvalidSignature
 
 from blockbee import BlockBeeCheckoutHelper, BlockBeeRequests
 
 
 class BlockBeeProvider(BasicProvider):
-    def __init__(self, apikey, redirect_url, notify_url, *args, **kwargs):
+    def __init__(self, apikey, *args, **kwargs):
         self.apikey = apikey
-        self.redirect_url = redirect_url
-        self.notify_url = notify_url
         super().__init__(*args, **kwargs)
 
     def get_form(self, payment, data=None):
-        parameters = {
-            "payment_id": payment.id,
-        }
+        protocol = "https" if settings.PAYMENT_USES_SSL else "http"
+        payment_host = settings.PAYMENT_HOST
+        base_url = f"{protocol}://{payment_host}"
+
+        notify_url = f"{base_url}/payments/process/blockbee/"
+        redirect_url = f"{base_url}{payment.get_success_url()}"
         
         bb_parameters = {
-            "notify_url": self.notify_url,
+            "notify_url": notify_url,
             "currency": payment.currency,
             "item_description": payment.description,
             "post": 1
         }
 
-        bb = BlockBeeCheckoutHelper(self.apikey, parameters, bb_parameters)
+        bb = BlockBeeCheckoutHelper(self.apikey, None, bb_parameters)
 
-        payment_request = bb.payment_request(self.redirect_url, payment.total)
+        payment_request = bb.payment_request(redirect_url, payment.total)
 
         if payment_request.get("status") != "success":
             raise Exception(f"BlockBee API error: {payment_request.get('error')}")
 
-        payment.transaction_id = payment_request.get("payment_id")
+        payment.token = payment_request.get("payment_id")
         payment.attrs.success_token = payment_request.get("success_token")
         payment.save()
-
-        return payment_request.get("payment_url")
+        
+        raise RedirectNeeded(payment_request.get("payment_url"))
 
 
     def process_data(self, payment, request):
@@ -89,6 +93,7 @@ class BlockBeeProvider(BasicProvider):
                     setattr(payment.attrs, key, val)
 
             payment.attrs.last_processed_payment_id = payment_id
+            payment.transaction_id = payload.get("txid")
             payment.save()
 
             if is_paid == "1" and status == "done":
@@ -99,17 +104,14 @@ class BlockBeeProvider(BasicProvider):
 
         return HttpResponseBadRequest("invalid webhook payload")
 
-    def get_transaction_id_from_request(self, request):
-        bb_payment_id = request.POST.get("payment_id")
-        if not bb_payment_id:
+    def get_token_from_request(self, payment, request):
+        if request.method != 'POST':
             return None
 
-        payment_obj = get_payment_model()
-        try:
-            payment = payment_obj.objects.get(variant="blockbee", transaction_id=bb_payment_id)
-            return payment.transaction_id
-        except Exception:
-            return None
+        token = request.POST.get("payment_id")
+        if token:
+            return token
+        return None
         
     def _verify_webhook_signature(self, request):
         if request.method != 'POST':
