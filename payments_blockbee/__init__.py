@@ -1,10 +1,17 @@
-import logging
+import base64
 
+from cryptography.exceptions import InvalidSignature
 from django.http import HttpResponse, HttpResponseBadRequest
 from payments import PaymentStatus, get_payment_model
 from payments.core import BasicProvider
 
-from blockbee import BlockBeeCheckoutHelper
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.backends import default_backend
+
+from blockbee import BlockBeeCheckoutHelper, BlockBeeRequests
+
 
 class BlockBeeProvider(BasicProvider):
     def __init__(self, apikey, redirect_url, notify_url, *args, **kwargs):
@@ -15,14 +22,15 @@ class BlockBeeProvider(BasicProvider):
 
     def get_form(self, payment, data=None):
         parameters = {
-                "payment_id": payment.id,
-            }
+            "payment_id": payment.id,
+        }
         
         bb_parameters = {
-                "notify_url": self.notify_url,
-                "currency": payment.currency,
-                "item_description": payment.description,
-            }
+            "notify_url": self.notify_url,
+            "currency": payment.currency,
+            "item_description": payment.description,
+            "post": 1
+        }
 
         bb = BlockBeeCheckoutHelper(self.apikey, parameters, bb_parameters)
 
@@ -39,9 +47,11 @@ class BlockBeeProvider(BasicProvider):
 
 
     def process_data(self, payment, request):
-        logger = logging.getLogger(__name__)
+        # Verify webhook signature before processing any data
+        if not self._verify_webhook_signature(request):
+            return HttpResponse(status=401)
 
-        data = request.GET
+        data = request.POST
         payload = {key: data.get(key) for key in data.keys()}
 
         if all(k in payload for k in ("payment_id", "is_paid", "status")):
@@ -55,11 +65,6 @@ class BlockBeeProvider(BasicProvider):
 
             expected_payment_id = getattr(payment.attrs, "payment_id", None)
             if expected_payment_id and expected_payment_id != payment_id:
-                logger.warning(
-                    "BlockBee webhook payment_id mismatch: expected %s, got %s",
-                    expected_payment_id,
-                    payment_id,
-                )
                 return HttpResponseBadRequest("payment_id mismatch")
 
             # Persist interesting fields for audit/debug
@@ -95,16 +100,48 @@ class BlockBeeProvider(BasicProvider):
         return HttpResponseBadRequest("invalid webhook payload")
 
     def get_transaction_id_from_request(self, request):
-        bb_payment_id = request.GET.get("payment_id")
+        bb_payment_id = request.POST.get("payment_id")
         if not bb_payment_id:
             return None
 
-        Payment = get_payment_model()
+        payment_obj = get_payment_model()
         try:
-            payment = Payment.objects.get(variant="blockbee", transaction_id=bb_payment_id)
+            payment = payment_obj.objects.get(variant="blockbee", transaction_id=bb_payment_id)
             return payment.transaction_id
         except Exception:
             return None
+        
+    def _verify_webhook_signature(self, request):
+        if request.method != 'POST':
+            return False
+
+        try:
+            data = request.body.decode('utf-8')
+
+            sig_b64 = request.headers["x-ca-signature"]
+            if not sig_b64:
+                return False
+
+            pubkey = BlockBeeRequests.process_request_get(endpoint="pubkey").get("pubkey")
+
+            signature = base64.b64decode(sig_b64)
+
+            try:
+                public_key = serialization.load_pem_public_key(
+                    pubkey.encode("utf-8"),
+                    backend=default_backend()
+                )
+                public_key.verify(
+                    signature,
+                    data.encode("utf-8"),
+                    padding.PKCS1v15(),
+                    hashes.SHA256()
+                )
+                return True
+            except InvalidSignature:
+                return False
+        except Exception:
+            return False
 
     def capture(self, payment, amount=None):
       # Implement payment capture logic
